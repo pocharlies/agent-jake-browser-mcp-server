@@ -19,6 +19,9 @@
     "paths": {
       "@agent-jake-browser/core": [
         "packages/core/src/product.ts"
+      ],
+      "@agent-jake-browser/protocol": [
+        "packages/protocol/src/index.ts"
       ]
     }
   }

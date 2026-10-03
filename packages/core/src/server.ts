@@ -9,10 +9,15 @@ import {
 import { createContext, type ContextManager } from './context.js';
 import { getAllTools } from './tools/index.js';
 import { logger } from './utils/logger.js';
+import { randomUUID } from 'crypto';
+import { createHarnessServer, type HarnessServer, type HarnessServerOptions } from './harness-server.js';
+import { callToolViaHarness } from './harness-routing.js';
 import type { Tool, ToolResult } from './types.js';
 
 export interface ServerOptions {
   port: number;
+  /** Negotiated endpoint (opt-in). Stdio gets one internal session UUID; it never accepts a client-supplied identity. */
+  harness?: HarnessServerOptions;
 }
 
 export interface MCPServer {
@@ -29,6 +34,8 @@ export async function createServer(options: ServerOptions): Promise<MCPServer> {
 
   // Create context for WebSocket communication
   const context = createContext({ port });
+  const harness: HarnessServer | undefined = options.harness ? createHarnessServer(options.harness) : undefined;
+  const stdioSessionId = randomUUID();
 
   // Get all available tools
   const tools = getAllTools();
@@ -59,8 +66,14 @@ export async function createServer(options: ServerOptions): Promise<MCPServer> {
   });
 
   // Handle tools/call request
-  server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     const { name, arguments: rawArgs } = request.params;
+    if (harness) {
+      return (await callToolViaHarness(harness, toolMap.get(name), name, rawArgs as Record<string, unknown> | undefined, {
+        sessionId: stdioSessionId,
+        signal: extra.signal,
+      })) as any;
+    }
     const args = { ...(rawArgs ?? {}) } as Record<string, unknown>;
     // `connection` selects the browser and never reaches the extension.
     const connection =
@@ -131,6 +144,8 @@ export async function createServer(options: ServerOptions): Promise<MCPServer> {
     context,
 
     async close(): Promise<void> {
+      harness?.broker.closeSession(stdioSessionId);
+      await harness?.close();
       await context.close();
       await server.close();
       logger.info('MCP server closed');

@@ -85,7 +85,11 @@ async function main(): Promise<void> {
       }
 
       // Create MCP server
-      const mcpServer = await createServer({ port });
+      const harnessPort = process.env.BROWSER_HARNESS_PORT ? Number(process.env.BROWSER_HARNESS_PORT) : undefined;
+      const mcpServer = await createServer({
+        port,
+        ...(harnessPort ? { harness: { port: harnessPort, house: process.env.BROWSER_HARNESS_HOUSE } } : {}),
+      });
 
       // Setup exit watchdog
       setupExitWatchdog();

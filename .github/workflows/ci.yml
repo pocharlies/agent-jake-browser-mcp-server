@@ -6,7 +6,7 @@ permissions:
   contents: read
 jobs:
   server:
-    runs-on: ubuntu-latest
+    runs-on: arc-k8s
     strategy:
       matrix:
         node: [22, 24]
@@ -19,6 +19,14 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
+      - run: npm run test:contract
+      - name: Core without houses (D2)
+        run: |
+          if grep -rEn 'house-pocharlies|house-staticduo|op-safe' packages/core packages/protocol --exclude-dir=node_modules --exclude-dir=dist --exclude=layering.test.ts; then exit 1; fi
+      - name: Protocol artifact packs and verifies offline
+        run: |
+          node packages/protocol/tools/pack.mjs "$RUNNER_TEMP/protocol-artifact"
+          node packages/protocol/tools/verify.mjs "$RUNNER_TEMP/protocol-artifact/agent-jake-browser-protocol.tgz" "$RUNNER_TEMP/protocol-artifact/provenance.json"
       - run: npm run build
       - name: Check both compiled entrypoints
         run: |

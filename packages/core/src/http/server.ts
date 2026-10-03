@@ -16,6 +16,8 @@ import { getAllTools } from '../tools/index.js';
 import { getSharedTokenStore } from '../token-store.js';
 import { createPairingStore } from '../pairing-store.js';
 import { patchZipConfig } from '../extension-zip.js';
+import { createHarnessServer, type HarnessServer, type HarnessServerOptions } from '../harness-server.js';
+import { callToolViaHarness } from '../harness-routing.js';
 
 
 export interface HttpServerOptions {
@@ -24,11 +26,25 @@ export interface HttpServerOptions {
   host?: string;
   extensionZip?: string;
   wsPath?: string;
+  /**
+   * Negotiated endpoint (/ws/harness). Opt-in: when set, MCP tool calls are routed ONLY to browsers that completed
+   * the authenticated hello, bound per MCP session. Legacy WS stays as configured; nothing falls back between them.
+   */
+  harness?: HarnessHttpOptions;
 }
+
+export type HarnessHttpOptions = HarnessServerOptions & {
+  /** Verifies the MCP caller on POST/GET/DELETE /mcp and returns its principal; null = reject (401). */
+  verifier?: (req: Request) => string | null | Promise<string | null>;
+  /** More than one house served by this listener: fails closed unless a verifier is provided. */
+  multiHouse?: boolean;
+};
 
 export interface HttpServer {
   app: Express;
   context: ContextManager;
+  /** Negotiated endpoint, when enabled. */
+  harness?: HarnessServer;
   listen(): Promise<HttpListener>;
   close(): Promise<void>;
 }
@@ -53,7 +69,17 @@ export function createHttpServer(options: HttpServerOptions = {}): HttpServer {
 
   const transports = new Map<string, StreamableHTTPServerTransport>();
   const servers = new Map<string, Server>();
+  const harnessOptions: HarnessHttpOptions | undefined = options.harness ?? (process.env.BROWSER_HARNESS_PORT
+    ? { port: Number(process.env.BROWSER_HARNESS_PORT), house: process.env.BROWSER_HARNESS_HOUSE }
+    : undefined);
+  if (harnessOptions?.multiHouse && !harnessOptions.verifier) {
+    throw new Error('negotiated multi-house mode requires an HTTP verifier on /mcp (fails closed)');
+  }
   const context = createContext({ port: WS_PORT });
+  const harness: HarnessServer | undefined = harnessOptions ? createHarnessServer(harnessOptions) : undefined;
+  const verifier = harnessOptions?.verifier;
+  /** MCP session -> principal that created it. Session ids are routing state, never credentials. */
+  const owners = new Map<string, string>();
   const tokenStore = getSharedTokenStore();
   const allTools = getAllTools();
   const toolMap = new Map(allTools.map((tool) => [tool.schema.name, tool]));
@@ -97,9 +123,24 @@ export function createHttpServer(options: HttpServerOptions = {}): HttpServer {
    * Resolve the target browser, run the tool against that connection and keep
    * `connection` out of the arguments sent to the extension.
    */
-  async function callTool(name: string, rawArgs?: Record<string, unknown>): Promise<ToolResult> {
+  async function callTool(
+    name: string,
+    rawArgs?: Record<string, unknown>,
+    extra?: { sessionId?: string; signal?: AbortSignal },
+  ): Promise<ToolResult> {
     const tool = toolMap.get(name);
     if (!tool) return textContent(`Unknown tool: ${name}`, true);
+
+    if (harness) {
+      // Server-side tools (browser_list_connections) answer from the broker; the rest go to the BOUND browser.
+      const sessionId = extra?.sessionId;
+      if (!sessionId) return textContent('session_closed: the MCP session has no identity', true);
+      return callToolViaHarness(harness, tool, name, rawArgs, {
+        sessionId,
+        principal: owners.get(sessionId),
+        signal: extra?.signal,
+      });
+    }
 
     const args = { ...(rawArgs ?? {}) };
     const connection =
@@ -142,8 +183,11 @@ export function createHttpServer(options: HttpServerOptions = {}): HttpServer {
       tools: toolsListPayload(),
     }));
 
-    server.setRequestHandler(CallToolRequestSchema, async (request) =>
-      callTool(request.params.name, request.params.arguments) as Promise<import('@modelcontextprotocol/sdk/types.js').CallToolResult>,
+    server.setRequestHandler(CallToolRequestSchema, async (request, extra) =>
+      callTool(request.params.name, request.params.arguments, {
+        sessionId: extra.sessionId,
+        signal: extra.signal,
+      }) as Promise<import('@modelcontextprotocol/sdk/types.js').CallToolResult>,
     );
 
     return server;
@@ -348,6 +392,41 @@ export function createHttpServer(options: HttpServerOptions = {}): HttpServer {
     return `${forwardedProto || req.protocol || 'http'}://${host}`;
   }
 
+  /**
+   * Negotiated mode: verify the caller on POST/GET/DELETE BEFORE any session lookup, and check that the session
+   * belongs to that principal. Unknown, expired and foreign ids are all 404 (no enumeration); a missing id on a
+   * non-initialize request is 400; an initialize without a session header creates a new session.
+   */
+  async function harnessGuard(req: Request, res: Response, next: NextFunction) {
+    if (!harness) return next();
+    let principal: string | null = 'operator';
+    if (verifier) {
+      try {
+        principal = await verifier(req);
+      } catch {
+        principal = null;
+      }
+    }
+    if (principal === null) {
+      res.status(401).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
+      return;
+    }
+    res.locals.principal = principal;
+    const sessionId = req.get('mcp-session-id');
+    const isInit = req.method === 'POST' && !sessionId && isInitializeRequest(req.body);
+    if (isInit) return next();
+    if (!sessionId) {
+      res.status(400).json({ jsonrpc: '2.0', error: { code: -32000, message: 'Bad Request: Mcp-Session-Id header is required' }, id: req.body?.id ?? null });
+      return;
+    }
+    if (owners.get(sessionId) !== principal || !transports.has(sessionId)) {
+      res.status(404).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Session not found' }, id: req.body?.id ?? null });
+      return;
+    }
+    next();
+  }
+  app.use('/mcp', harnessGuard);
+
   app.post('/mcp', async (req, res) => {
     try {
       if (!req.headers['mcp-session-id'] && req.body?.method === 'tools/list') {
@@ -367,12 +446,15 @@ export function createHttpServer(options: HttpServerOptions = {}): HttpServer {
           onsessioninitialized: (newSessionId) => {
             transports.set(newSessionId, transport);
             servers.set(newSessionId, server);
+            if (harness) owners.set(newSessionId, String(res.locals.principal ?? 'operator'));
           },
         });
         transport.onclose = () => {
           if (transport.sessionId) {
             transports.delete(transport.sessionId);
             servers.delete(transport.sessionId);
+            owners.delete(transport.sessionId);
+            harness?.broker.closeSession(transport.sessionId);
           }
         };
         server = createMcpServer();
@@ -410,6 +492,11 @@ export function createHttpServer(options: HttpServerOptions = {}): HttpServer {
       return;
     }
     await transport.handleRequest(req, res, req.body);
+    // DELETE is the logical end of the session. An SSE stream ending is not.
+    if (harness && sessionId) {
+      owners.delete(sessionId);
+      harness.broker.closeSession(sessionId);
+    }
   });
 
 
@@ -417,6 +504,7 @@ export function createHttpServer(options: HttpServerOptions = {}): HttpServer {
   return {
     app,
     context,
+    harness,
     async listen() {
       if (listener) return listener;
       // HTTP remains loopback by default; authentication is provided by the operator's proxy.
@@ -439,6 +527,7 @@ export function createHttpServer(options: HttpServerOptions = {}): HttpServer {
         listener = undefined;
         await new Promise<void>((resolve, reject) => active.close((error) => error ? reject(error) : resolve()));
       }
+      await harness?.close();
       await context.close();
     },
   };

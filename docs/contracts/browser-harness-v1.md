@@ -1,5 +1,10 @@
 # Current Browser Harness wire contract
 
+> **Status: deprecated (INFRA-386).** This is the unversioned legacy wire. It is kept unchanged and executable
+> (legacy fixtures and wire tests) until the legacy-retirement rule of M1B is met, and is superseded by
+> [`browser-harness-v2.md`](browser-harness-v2.md), the negotiated surface. Do not add behavior here; a breaking
+> change is a new `.vN+1` document next to this one.
+
 This document describes the existing M1A behavior. The filename is a documentation
 identifier; no protocol version is negotiated or advertised by this change.
 
